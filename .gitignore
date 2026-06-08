@@ -105,3 +105,9 @@ InitTestScene*.unity*
 
 # Auto-generated scenes by play mode tests
 /[Aa]ssets/[Ii]nit[Tt]est[Ss]cene*.unity*
+
+# JetBrains Rider IDE (per-developer)
+.idea/
+
+# Unity editor tooling settings (machine-specific)
+/ProjectSettings/Packages/
