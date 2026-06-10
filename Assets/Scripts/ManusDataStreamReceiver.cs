@@ -103,10 +103,14 @@ namespace UltraPose
 			if( p_Out.publish ) Publish( t_Message );
 		}
 
-		/// <summary>Debug-log a stream message to the Console. Independent of publishing.</summary>
+		/// <summary>
+		/// Debug-log a stream message to the Console, prefixed with "Unix Time:" and the Unix time
+		/// in milliseconds (since 1970-01-01 UTC) at which Unity logged it. Independent of publishing.
+		/// </summary>
 		private void Log( string p_Message )
 		{
-			Debug.Log( p_Message );
+			long t_UnixTimeMs = System.DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+			Debug.Log( $"Unix Time: {t_UnixTimeMs}, {p_Message}" );
 		}
 
 		/// <summary>Send a stream message to the external process (e.g. Python). Transport only — no logging.</summary>
