@@ -15,8 +15,17 @@ namespace UltraPose
 	/// - log     -> Debug.Log to the Console (see <see cref="Log"/>)
 	/// - publish -> send to the external process / transport (see <see cref="Publish"/>)
 	///
-	/// All handlers run on the Unity main thread (JsonUtility is main-thread only — fine). Enums
-	/// serialize as integers; mirror the enum tables in ManusSDKTypes.cs on the Python side.
+	/// All handlers run on the Unity main thread (CommunicationHub dispatches every event via
+	/// UnityMainThreadDispatcher). Enums serialize as integers; mirror the enum tables in
+	/// ManusSDKTypes.cs on the Python side.
+	///
+	/// JSON payload notes for consumers:
+	/// - gesture: totalGestureCount / gestureCount are always 0 (the SDK never copies them into
+	///   the published struct) — gestureData's length is the real count.
+	/// - Fixed-size marshaled arrays serialize in full: rawDevice sensorData always has 5 entries
+	///   (only sensorCount are valid), ergonomics data always 40 floats (index by
+	///   ErgonomicsDataType), glove iMUCalibrationInfo always 6.
+	/// - hostsFound re-fires every ~10 s while disconnected (host auto-find cycle), not one-shot.
 	/// </summary>
 	public class ManusDataStreamReceiver : MonoBehaviour
 	{
