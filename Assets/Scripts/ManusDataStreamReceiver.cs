@@ -1,4 +1,4 @@
-using System.Linq;
+using System.Collections.Generic;
 
 using Manus;
 using UnityEngine;
@@ -6,52 +6,53 @@ using UnityEngine;
 namespace UltraPose
 {
 	/// <summary>
-	/// Central subscriber for every Manus Core data + connection stream exposed by
-	/// <see cref="ManusManager.communicationHub"/>.
+	/// Subscribes to every Manus Core data + connection stream on
+	/// <see cref="ManusManager.communicationHub"/>, converts each payload to JSON via
+	/// <see cref="JsonUtility"/> (original field names preserved), wraps it in a
+	/// { "stream": "...", "payload": {...} } envelope, and routes it.
 	///
-	/// Each stream has an Inspector debug toggle; when enabled, the matching handler
-	/// prints a concise summary of that stream to the Console. All handlers run on the
-	/// Unity main thread, so logging here is safe.
+	/// Logging and publishing are independent, controlled per stream via <see cref="StreamOutput"/>:
+	/// - log     -> Debug.Log to the Console (see <see cref="Log"/>)
+	/// - publish -> send to the external process / transport (see <see cref="Publish"/>)
 	///
-	/// NOTE: skeleton / ergonomics / raw / tracker streams fire at high frequency
-	/// (~60-120 Hz). Leaving those toggles on floods the Console and slows the Editor —
-	/// enable only while inspecting a specific stream.
+	/// All handlers run on the Unity main thread (JsonUtility is main-thread only — fine). Enums
+	/// serialize as integers; mirror the enum tables in ManusSDKTypes.cs on the Python side.
 	/// </summary>
 	public class ManusDataStreamReceiver : MonoBehaviour
 	{
-		[Header( "Debug log — data streams" )]
-		[Tooltip( "Posed skeleton(s) registered with Core." )]
-		[SerializeField] private bool m_LogSkeleton = false;
-		[Tooltip( "Finger joint angles (20 per hand)." )]
-		[SerializeField] private bool m_LogErgonomics = false;
-		[Tooltip( "Per-glove hand skeleton from Core's estimation engine." )]
-		[SerializeField] private bool m_LogRawSkeleton = false;
-		[Tooltip( "Raw per-sensor transforms + glove quaternion." )]
-		[SerializeField] private bool m_LogRawDevice = false;
-		[Tooltip( "Recognized gesture probabilities." )]
-		[SerializeField] private bool m_LogGesture = false;
-		[Tooltip( "External tracker positions/rotations." )]
-		[SerializeField] private bool m_LogTracker = false;
-		[Tooltip( "Device/user/skeleton/tracker inventory." )]
-		[SerializeField] private bool m_LogLandscape = false;
-		[Tooltip( "System / diagnostic messages." )]
-		[SerializeField] private bool m_LogSystemMessage = false;
+		/// <summary>Per-stream output control: log to Console and/or publish to transport, independently.</summary>
+		[System.Serializable]
+		public struct StreamOutput
+		{
+			public bool log;
+			public bool publish;
+			public bool Any => log || publish;
+		}
 
-		[Header( "Debug log — connection" )]
-		[SerializeField] private bool m_LogConnected = false;
-		[SerializeField] private bool m_LogDisconnected = false;
-		[SerializeField] private bool m_LogHostsFound = false;
+		[Header( "Data streams (log / publish)" )]
+		[SerializeField] private StreamOutput m_Skeleton;
+		[SerializeField] private StreamOutput m_Ergonomics;
+		[SerializeField] private StreamOutput m_RawSkeleton;
+		[SerializeField] private StreamOutput m_RawDevice;
+		[SerializeField] private StreamOutput m_Gesture;
+		[SerializeField] private StreamOutput m_Tracker;
+		[SerializeField] private StreamOutput m_Landscape;
+		[SerializeField] private StreamOutput m_SystemMessage;
+
+		[Header( "Connection (log / publish)" )]
+		[SerializeField] private StreamOutput m_Connected;
+		[SerializeField] private StreamOutput m_Disconnected;
+		[SerializeField] private StreamOutput m_HostsFound;
 
 		/// <summary>
-		/// Subscribe to all streams. The communication hub is runtime-only and survives
-		/// scene loads, so we (un)subscribe per enable/disable.
+		/// Subscribe to all streams. The communication hub is runtime-only and survives scene loads,
+		/// so we (un)subscribe per enable/disable.
 		/// </summary>
 		private void OnEnable()
 		{
 			var t_Hub = ManusManager.communicationHub;
-			if( t_Hub == null ) return; // null while compiling / shutting down
+			if( t_Hub == null ) return;
 
-			// Data streams
 			t_Hub.onSkeletonData.AddListener( OnSkeletonData );
 			t_Hub.onErgonomicsData.AddListener( OnErgonomicsData );
 			t_Hub.onRawSkeletonData.AddListener( OnRawSkeletonData );
@@ -61,22 +62,16 @@ namespace UltraPose
 			t_Hub.onLandscapeEvent.AddListener( OnLandscape );
 			t_Hub.onSystemMessageEvent.AddListener( OnSystemMessage );
 
-			// Connection lifecycle
 			t_Hub.onConnectedToCore.AddListener( OnConnectedToCore );
 			t_Hub.onDisconnectedFromCore.AddListener( OnDisconnectedFromCore );
 			t_Hub.onHostsFound.AddListener( OnHostsFound );
 		}
 
-		/// <summary>
-		/// Unsubscribe from all streams. Required because the hub outlives this component —
-		/// leaving listeners attached triggers "listener on destroyed object" errors.
-		/// </summary>
 		private void OnDisable()
 		{
 			var t_Hub = ManusManager.communicationHub;
 			if( t_Hub == null ) return;
 
-			// Data streams
 			t_Hub.onSkeletonData.RemoveListener( OnSkeletonData );
 			t_Hub.onErgonomicsData.RemoveListener( OnErgonomicsData );
 			t_Hub.onRawSkeletonData.RemoveListener( OnRawSkeletonData );
@@ -86,109 +81,77 @@ namespace UltraPose
 			t_Hub.onLandscapeEvent.RemoveListener( OnLandscape );
 			t_Hub.onSystemMessageEvent.RemoveListener( OnSystemMessage );
 
-			// Connection lifecycle
 			t_Hub.onConnectedToCore.RemoveListener( OnConnectedToCore );
 			t_Hub.onDisconnectedFromCore.RemoveListener( OnDisconnectedFromCore );
 			t_Hub.onHostsFound.RemoveListener( OnHostsFound );
 		}
 
-		// ---- Data stream handlers (invoked on the Unity main thread) ----
+		// ---- Emission: log and publish are independent ----
 
-		/// <summary>Posed skeleton(s) registered with Manus Core (node transforms).</summary>
-		private void OnSkeletonData( CoreSDK.SkeletonStream p_Stream )
+		/// <summary>Serialize + route a stream payload. Builds JSON once, and only if log or publish is on.</summary>
+		private void Emit<T>( StreamOutput p_Out, string p_Stream, T p_Payload )
 		{
-			if( !m_LogSkeleton ) return;
-			string t_Detail = p_Stream.skeletons == null ? "" :
-				string.Join( ", ", p_Stream.skeletons.Select( s => $"id={s.id} nodes={s.nodes?.Length ?? 0}" ) );
-			Debug.Log( $"[Manus] Skeleton t={p_Stream.publishTime.time} count={p_Stream.skeletons?.Count ?? 0} [{t_Detail}]" );
+			if( !p_Out.Any ) return;
+			Emit( p_Out, p_Stream, JsonUtility.ToJson( p_Payload ) );
 		}
 
-		/// <summary>Finger joint angles, 20 per hand; index by CoreSDK.ErgonomicsDataType.</summary>
-		private void OnErgonomicsData( CommunicationHub.ErgonomicsStream p_Stream )
+		/// <summary>Route an already-serialized payload (used by connection events that build JSON manually).</summary>
+		private void Emit( StreamOutput p_Out, string p_Stream, string p_PayloadJson )
 		{
-			if( !m_LogErgonomics ) return;
-			if( p_Stream.data == null ) { Debug.Log( "[Manus] Ergonomics: <none>" ); return; }
-			// data[] order follows CoreSDK.ErgonomicsDataType (Left 0-19, Right 20-39): per finger = MCP spread, MCP stretch, PIP stretch, DIP stretch
-			foreach( var t_D in p_Stream.data )
-			{
-				string t_Values = t_D.data == null ? "" : string.Join( ", ", t_D.data.Select( v => v.ToString( "F1" ) ) );
-				Debug.Log( $"[Manus] Ergonomics id={t_D.id} isUserID={t_D.isUserID} values=[{t_Values}]" );
-			}
+			string t_Message = $"{{\"stream\":\"{p_Stream}\",\"payload\":{p_PayloadJson}}}";
+			if( p_Out.log ) Log( t_Message );
+			if( p_Out.publish ) Publish( t_Message );
 		}
 
-		/// <summary>Per-glove hand skeleton straight from Core's estimation engine (keyed by gloveId).</summary>
-		private void OnRawSkeletonData( CoreSDK.RawSkeletonStream p_Stream )
+		/// <summary>Debug-log a stream message to the Console. Independent of publishing.</summary>
+		private void Log( string p_Message )
 		{
-			if( !m_LogRawSkeleton ) return;
-			string t_Detail = p_Stream.skeletons == null ? "" :
-				string.Join( ", ", p_Stream.skeletons.Select( s => $"glove={s.gloveId} nodes={s.nodes?.Length ?? 0}" ) );
-			Debug.Log( $"[Manus] RawSkeleton t={p_Stream.publishTime.time} gloves={p_Stream.skeletons?.Count ?? 0} [{t_Detail}]" );
+			Debug.Log( p_Message );
 		}
 
-		/// <summary>Raw per-sensor transforms (up to 5) + glove case quaternion.</summary>
-		private void OnRawDeviceData( CoreSDK.RawData p_Data )
+		/// <summary>Send a stream message to the external process (e.g. Python). Transport only — no logging.</summary>
+		private void Publish( string p_Message )
 		{
-			if( !m_LogRawDevice ) return;
-			string t_Detail = p_Data.rawDeviceData == null ? "" :
-				string.Join( ", ", p_Data.rawDeviceData.Select( d => $"id={d.id} sensors={d.sensorCount}" ) );
-			Debug.Log( $"[Manus] RawDevice t={p_Data.publishTime.time} devices={p_Data.rawDeviceData?.Count ?? 0} [{t_Detail}]" );
+			// TODO transport: send p_Message to the external process here (socket / pipe / etc.).
 		}
 
-		/// <summary>Recognized gesture probabilities per user/glove.</summary>
-		private void OnGestureData( CoreSDK.GestureStream p_Stream )
-		{
-			if( !m_LogGesture ) return;
-			// NOTE: ProcessInternalGestureStream only fills id/isUserID/gestureData; gestureCount/totalGestureCount stay 0 — use gestureData.Length.
-			string t_Detail = p_Stream.gestureProbabilities == null ? "" :
-				string.Join( ", ", p_Stream.gestureProbabilities.Select( g => $"id={g.id} probs={g.gestureData?.Length ?? 0}" ) );
-			Debug.Log( $"[Manus] Gesture t={p_Stream.publishTime.time} entries={p_Stream.gestureProbabilities?.Count ?? 0} [{t_Detail}]" );
-		}
+		// ---- Data stream handlers ----
+		private void OnSkeletonData( CoreSDK.SkeletonStream p_Stream ) => Emit( m_Skeleton, "skeleton", p_Stream );
+		private void OnErgonomicsData( CommunicationHub.ErgonomicsStream p_Stream ) => Emit( m_Ergonomics, "ergonomics", p_Stream );
+		private void OnRawSkeletonData( CoreSDK.RawSkeletonStream p_Stream ) => Emit( m_RawSkeleton, "rawSkeleton", p_Stream );
+		private void OnRawDeviceData( CoreSDK.RawData p_Data ) => Emit( m_RawDevice, "rawDevice", p_Data );
+		private void OnGestureData( CoreSDK.GestureStream p_Stream ) => Emit( m_Gesture, "gesture", p_Stream );
+		private void OnTrackerData( CoreSDK.TrackerStream p_Stream ) => Emit( m_Tracker, "tracker", p_Stream );
+		private void OnLandscape( CommunicationHub.Landscape p_Landscape ) => Emit( m_Landscape, "landscape", p_Landscape );
+		private void OnSystemMessage( CoreSDK.SystemMessage p_Message ) => Emit( m_SystemMessage, "system", p_Message );
 
-		/// <summary>External tracker positions/rotations; trackerType is the body slot, quality is tracking state.</summary>
-		private void OnTrackerData( CoreSDK.TrackerStream p_Stream )
-		{
-			if( !m_LogTracker ) return;
-			string t_Detail = p_Stream.trackers == null ? "" :
-				string.Join( ", ", p_Stream.trackers.Select( t => $"{t.trackerId.id}:{t.trackerType}/{t.quality}@({t.position.x:F2},{t.position.y:F2},{t.position.z:F2})" ) );
-			Debug.Log( $"[Manus] Tracker t={p_Stream.publishTime.time} count={p_Stream.trackers?.Count ?? 0} [{t_Detail}]" );
-		}
-
-		/// <summary>Inventory + state: dongles, gloves, users, skeletons, trackers.</summary>
-		private void OnLandscape( CommunicationHub.Landscape p_Landscape )
-		{
-			if( !m_LogLandscape ) return;
-			Debug.Log( $"[Manus] Landscape dongles={p_Landscape.dongles.Count} gloves={p_Landscape.gloves.Count} " +
-				$"users={p_Landscape.users.Count} skeletons={p_Landscape.skeletons.Count} trackers={p_Landscape.trackers.Count}" );
-		}
-
-		/// <summary>Diagnostics / system events from Manus Core.</summary>
-		private void OnSystemMessage( CoreSDK.SystemMessage p_Message )
-		{
-			if( !m_LogSystemMessage ) return;
-			Debug.Log( $"[Manus] System {p_Message.type}: \"{p_Message.infoString}\" ({p_Message.infoUInt})" );
-		}
-
-		// ---- Connection lifecycle handlers ----
-
-		/// <summary>Connected to a Manus Core host.</summary>
+		// ---- Connection handlers (no parameter — payloads constructed) ----
 		private void OnConnectedToCore()
 		{
-			if( !m_LogConnected ) return;
-			Debug.Log( $"[Manus] Connected to Core (host: {ManusManager.communicationHub?.currentHost?.hostName})" );
+			if( !m_Connected.Any ) return;
+			var t_Host = ManusManager.communicationHub?.currentHost;
+			Emit( m_Connected, "connected", t_Host.HasValue ? JsonUtility.ToJson( t_Host.Value ) : "{}" );
 		}
 
-		/// <summary>Disconnected from the Manus Core host.</summary>
 		private void OnDisconnectedFromCore()
 		{
-			if( !m_LogDisconnected ) return;
-			Debug.Log( "[Manus] Disconnected from Core" );
+			if( !m_Disconnected.Any ) return;
+			Emit( m_Disconnected, "disconnected", "{}" );
 		}
 
-		/// <summary>The list of available hosts was updated.</summary>
 		private void OnHostsFound()
 		{
-			if( !m_LogHostsFound ) return;
-			Debug.Log( $"[Manus] Hosts found: {ManusManager.communicationHub?.GetHosts()?.Count ?? 0}" );
+			if( !m_HostsFound.Any ) return;
+			var t_Hub = ManusManager.communicationHub;
+			if( t_Hub == null ) return;
+			Emit( m_HostsFound, "hostsFound", JsonUtility.ToJson( new HostsMessage { hosts = t_Hub.GetHosts() } ) );
+		}
+
+		/// <summary>Wrapper so the discovered-hosts list serializes — JsonUtility can't root a List.</summary>
+		[System.Serializable]
+		private struct HostsMessage
+		{
+			public List<CoreSDK.ManusHost> hosts;
 		}
 	}
 }

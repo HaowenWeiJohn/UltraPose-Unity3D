@@ -461,17 +461,39 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: a625093aa03d14b4982f381e8a534b76, type: 3}
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::UltraPose.ManusDataStreamReceiver
-  m_LogSkeleton: 0
-  m_LogErgonomics: 0
-  m_LogRawSkeleton: 0
-  m_LogRawDevice: 0
-  m_LogGesture: 0
-  m_LogTracker: 0
-  m_LogLandscape: 0
-  m_LogSystemMessage: 0
-  m_LogConnected: 0
-  m_LogDisconnected: 0
-  m_LogHostsFound: 0
+  m_Skeleton:
+    log: 0
+    publish: 1
+  m_Ergonomics:
+    log: 0
+    publish: 1
+  m_RawSkeleton:
+    log: 0
+    publish: 1
+  m_RawDevice:
+    log: 0
+    publish: 1
+  m_Gesture:
+    log: 0
+    publish: 1
+  m_Tracker:
+    log: 0
+    publish: 1
+  m_Landscape:
+    log: 0
+    publish: 1
+  m_SystemMessage:
+    log: 0
+    publish: 1
+  m_Connected:
+    log: 0
+    publish: 1
+  m_Disconnected:
+    log: 0
+    publish: 1
+  m_HostsFound:
+    log: 0
+    publish: 1
 --- !u!4 &921270114
 Transform:
   m_ObjectHideFlags: 0
