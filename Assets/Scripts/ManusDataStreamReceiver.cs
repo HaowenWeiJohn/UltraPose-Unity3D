@@ -9,9 +9,10 @@ namespace UltraPose
 	/// Subscribes to every Manus Core data + connection stream on
 	/// <see cref="ManusManager.communicationHub"/>, converts each payload to JSON via
 	/// <see cref="JsonUtility"/> (original field names preserved), wraps it in a
-	/// { "stream": "...", "unityEmitUnixTimeMs": ..., "unityRealtimeSinceStartupSec": ...,
+	/// { "stream": "...", "unityEmitUnixTimeSec": ..., "unityRealtimeSinceStartupSec": ...,
 	/// "payload": {...} } envelope, and routes it. Both times are captured when the envelope is
-	/// built: unityEmitUnixTimeMs is wall clock (UTC milliseconds since 1970-01-01, distinct from
+	/// built: unityEmitUnixTimeSec is wall clock (UTC seconds since 1970-01-01, millisecond
+	/// precision in the fractional part, distinct from
 	/// the Manus publishTime bitfield inside the payload); unityRealtimeSinceStartupSec is
 	/// monotonic time since Unity started (editor launch in the Editor, app launch in builds —
 	/// not since entering play mode).
@@ -140,17 +141,17 @@ namespace UltraPose
 		/// <summary>Route an already-serialized payload (used by connection events that build JSON manually).</summary>
 		private void Emit( StreamOutput p_Out, string p_Stream, string p_PayloadJson )
 		{
-			long t_UnixTimeMs = System.DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 			// InvariantCulture: a comma-decimal locale would otherwise produce invalid JSON.
+			string t_UnixTimeSec = ( System.DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0 ).ToString( "F3", System.Globalization.CultureInfo.InvariantCulture );
 			string t_RealtimeSec = Time.realtimeSinceStartupAsDouble.ToString( "F6", System.Globalization.CultureInfo.InvariantCulture );
-			string t_Message = $"{{\"stream\":\"{p_Stream}\",\"unityEmitUnixTimeMs\":{t_UnixTimeMs},\"unityRealtimeSinceStartupSec\":{t_RealtimeSec},\"payload\":{p_PayloadJson}}}";
+			string t_Message = $"{{\"stream\":\"{p_Stream}\",\"unityEmitUnixTimeSec\":{t_UnixTimeSec},\"unityRealtimeSinceStartupSec\":{t_RealtimeSec},\"payload\":{p_PayloadJson}}}";
 			if( p_Out.log ) Log( t_Message );
 			if( p_Out.publish ) Publish( p_Stream, t_Message );
 		}
 
 		/// <summary>
 		/// Debug-log a stream message to the Console as-is (the envelope already carries
-		/// unityEmitUnixTimeMs). Independent of publishing.
+		/// unityEmitUnixTimeSec). Independent of publishing.
 		/// </summary>
 		private void Log( string p_Message )
 		{
