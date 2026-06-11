@@ -9,11 +9,21 @@ namespace UltraPose
 	/// Subscribes to every Manus Core data + connection stream on
 	/// <see cref="ManusManager.communicationHub"/>, converts each payload to JSON via
 	/// <see cref="JsonUtility"/> (original field names preserved), wraps it in a
-	/// { "stream": "...", "payload": {...} } envelope, and routes it.
+	/// { "stream": "...", "unityEmitUnixTimeMs": ..., "unityRealtimeSinceStartupSec": ...,
+	/// "payload": {...} } envelope, and routes it. Both times are captured when the envelope is
+	/// built: unityEmitUnixTimeMs is wall clock (UTC milliseconds since 1970-01-01, distinct from
+	/// the Manus publishTime bitfield inside the payload); unityRealtimeSinceStartupSec is
+	/// monotonic time since Unity started (editor launch in the Editor, app launch in builds —
+	/// not since entering play mode).
 	///
 	/// Logging and publishing are independent, controlled per stream via <see cref="StreamOutput"/>:
 	/// - log     -> Debug.Log to the Console (see <see cref="Log"/>)
-	/// - publish -> send to the external process / transport (see <see cref="Publish"/>)
+	/// - publish -> ZMQ PUB socket (<see cref="ZmqPublisher"/>) as [stream name][envelope JSON]
+	///   UTF-8 frames, so subscribers can filter per stream without parsing JSON
+	///
+	/// PUB/SUB is lossy: late subscribers miss earlier messages (slow joiner) and stalled ones
+	/// drop frames past the high-water mark. Continuous streams self-heal next tick; one-shot
+	/// connected/disconnected may be missed — landscape (~1 Hz) is the liveness signal.
 	///
 	/// All handlers run on the Unity main thread (CommunicationHub dispatches every event via
 	/// UnityMainThreadDispatcher). Enums serialize as integers; mirror the enum tables in
@@ -52,6 +62,29 @@ namespace UltraPose
 		[SerializeField] private StreamOutput m_Connected;
 		[SerializeField] private StreamOutput m_Disconnected;
 		[SerializeField] private StreamOutput m_HostsFound;
+
+		[Header( "ZeroMQ transport" )]
+		[Tooltip( "PUB socket bind address; external subscribers connect here." )]
+		[SerializeField] private string m_PublishAddress = "tcp://127.0.0.1:5560";
+		[Tooltip( "Per-subscriber outbound queue limit in messages; frames drop beyond this if a consumer stalls." )]
+		[SerializeField] private int m_SendHighWaterMark = 1000;
+
+		private ZmqPublisher m_Publisher;
+
+		/// <summary>
+		/// The publisher spans the component's whole lifetime (Awake..OnDestroy) rather than
+		/// enable/disable, so toggling the component doesn't rebind the TCP port.
+		/// </summary>
+		private void Awake()
+		{
+			m_Publisher = new ZmqPublisher( m_PublishAddress, m_SendHighWaterMark );
+		}
+
+		private void OnDestroy()
+		{
+			m_Publisher?.Dispose();
+			m_Publisher = null;
+		}
 
 		/// <summary>
 		/// Subscribe to all streams. The communication hub is runtime-only and survives scene loads,
@@ -107,25 +140,28 @@ namespace UltraPose
 		/// <summary>Route an already-serialized payload (used by connection events that build JSON manually).</summary>
 		private void Emit( StreamOutput p_Out, string p_Stream, string p_PayloadJson )
 		{
-			string t_Message = $"{{\"stream\":\"{p_Stream}\",\"payload\":{p_PayloadJson}}}";
+			long t_UnixTimeMs = System.DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+			// InvariantCulture: a comma-decimal locale would otherwise produce invalid JSON.
+			string t_RealtimeSec = Time.realtimeSinceStartupAsDouble.ToString( "F6", System.Globalization.CultureInfo.InvariantCulture );
+			string t_Message = $"{{\"stream\":\"{p_Stream}\",\"unityEmitUnixTimeMs\":{t_UnixTimeMs},\"unityRealtimeSinceStartupSec\":{t_RealtimeSec},\"payload\":{p_PayloadJson}}}";
 			if( p_Out.log ) Log( t_Message );
-			if( p_Out.publish ) Publish( t_Message );
+			if( p_Out.publish ) Publish( p_Stream, t_Message );
 		}
 
 		/// <summary>
-		/// Debug-log a stream message to the Console, prefixed with "Unix Time:" and the Unix time
-		/// in milliseconds (since 1970-01-01 UTC) at which Unity logged it. Independent of publishing.
+		/// Debug-log a stream message to the Console as-is (the envelope already carries
+		/// unityEmitUnixTimeMs). Independent of publishing.
 		/// </summary>
 		private void Log( string p_Message )
 		{
-			long t_UnixTimeMs = System.DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-			Debug.Log( $"Unix Time: {t_UnixTimeMs}, {p_Message}" );
+			Debug.Log( p_Message );
 		}
 
-		/// <summary>Send a stream message to the external process (e.g. Python). Transport only — no logging.</summary>
-		private void Publish( string p_Message )
+		/// <summary>Send a stream message to the external process (e.g. Python) over ZMQ as
+		/// [topic = stream name][envelope JSON]. Transport only — no logging.</summary>
+		private void Publish( string p_Stream, string p_Message )
 		{
-			// TODO transport: send p_Message to the external process here (socket / pipe / etc.).
+			m_Publisher?.Publish( p_Stream, p_Message );
 		}
 
 		// ---- Data stream handlers ----

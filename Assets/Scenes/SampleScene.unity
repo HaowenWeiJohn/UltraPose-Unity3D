@@ -494,6 +494,8 @@ MonoBehaviour:
   m_HostsFound:
     log: 0
     publish: 1
+  m_PublishAddress: tcp://127.0.0.1:5560
+  m_SendHighWaterMark: 2000
 --- !u!4 &921270114
 Transform:
   m_ObjectHideFlags: 0
