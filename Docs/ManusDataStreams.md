@@ -56,6 +56,7 @@ Every message on every topic has the same wrapper:
 {
   "stream": string,                       // topic name, identical to ZMQ frame 0
   "unityEmitUnixTimeSec": number,         // wall clock, UTC seconds since 1970-01-01, 3 decimals (ms precision)
+  "manusPublishUnixTimeSec": number,      // Manus Core publishTime as UTC Unix seconds, 3 decimals (ms precision)
   "unityRealtimeSinceStartupSec": number, // monotonic seconds since Unity started, 6 decimals
   "payload": object                       // stream-specific (sections below)
 }
@@ -64,15 +65,24 @@ Every message on every topic has the same wrapper:
 Example:
 
 ```json
-{"stream":"skeleton","unityEmitUnixTimeSec":1781191812.345,"unityRealtimeSinceStartupSec":127.483912,"payload":{}}
+{"stream":"skeleton","unityEmitUnixTimeSec":1781191812.345,"manusPublishUnixTimeSec":1781191812.339,"unityRealtimeSinceStartupSec":127.483912,"payload":{}}
 ```
 
 Timestamp semantics:
 
-- Both times are JSON **numbers** (not strings) and are captured **when the envelope is
-  built** in Unity — they measure emit time, not capture time on the gloves.
+- All three times are JSON **numbers** (not strings). The two Unity times are captured **when
+  the envelope is built** in Unity — they measure emit time, not capture time on the gloves.
 - `unityEmitUnixTimeSec` — wall clock (UTC Unix seconds, millisecond precision in the
-  fractional part). Distinct from the Manus `publishTime` inside the payload (§3.4).
+  fractional part).
+- `manusPublishUnixTimeSec` — Manus Core's own `publishTime` (the §3.4 bitfield) decoded to
+  UTC Unix seconds (ms precision) so consumers don't have to decode it. Unity uses the SDK's
+  official decoder (`CoreSdk_GetTimestampInfo`). The streams that carry a `publishTime`
+  (`skeleton`, `ergonomics`, `rawSkeleton`, `rawDevice`, `gesture`, `tracker`) report the decoded
+  Core time, which **slightly precedes** `unityEmitUnixTimeSec` (the Core→Unity hop). The streams
+  that don't (`landscape`, `system`, `connected`, `disconnected`, `hostsFound`) — and the rare
+  cases where decoding fails or the timestamp is in timecode mode — set this **equal to**
+  `unityEmitUnixTimeSec`. So you can always read this one field; if you must tell "real Core time"
+  from the fallback, compare it against `unityEmitUnixTimeSec` and/or key off the topic.
 - `unityRealtimeSinceStartupSec` — monotonic since Unity startup (editor launch in the
   Editor, app launch in builds — **not** since entering play mode). Use for ordering /
   intervals; immune to wall-clock jumps.
@@ -157,6 +167,11 @@ Worked example: `139252970959193` decodes to `2026-06-11 15:30:12.345 UTC`.
 Never do arithmetic (deltas, comparisons across field boundaries) on the raw `time` value —
 it rolls over odometer-style at each calendar field. Decode first.
 
+For the **stream-level** `publishTime`, the envelope already exposes this decoded to UTC Unix
+seconds as `manusPublishUnixTimeSec` (§2) — prefer that. You only need this decoder for the other
+timestamps embedded in payloads (`lastUpdateTime`, `lastSeen`, `firmwareTimestamp`, calibration
+times, …).
+
 ### 3.5 Version
 
 ```jsonc
@@ -213,7 +228,7 @@ Animated skeleton data for every skeleton loaded in Manus Core / the Unity sessi
 Example (1 skeleton, 2 nodes):
 
 ```json
-{"stream":"skeleton","unityEmitUnixTimeSec":1781191812.351,"unityRealtimeSinceStartupSec":127.489102,"payload":{
+{"stream":"skeleton","unityEmitUnixTimeSec":1781191812.351,"manusPublishUnixTimeSec":1781191812.345,"unityRealtimeSinceStartupSec":127.489102,"payload":{
   "publishTime":{"time":139252970959193},
   "skeletons":[{"id":3,"nodes":[
     {"id":0,"transform":{"position":{"x":0.012,"y":1.342,"z":0.207},"rotation":{"w":0.998,"x":0.011,"y":-0.052,"z":0.003},"scale":{"x":1.0,"y":1.0,"z":1.0}}},

@@ -9,13 +9,16 @@ namespace UltraPose
 	/// Subscribes to every Manus Core data + connection stream on
 	/// <see cref="ManusManager.communicationHub"/>, converts each payload to JSON via
 	/// <see cref="JsonUtility"/> (original field names preserved), wraps it in a
-	/// { "stream": "...", "unityEmitUnixTimeSec": ..., "unityRealtimeSinceStartupSec": ...,
-	/// "payload": {...} } envelope, and routes it. Both times are captured when the envelope is
-	/// built: unityEmitUnixTimeSec is wall clock (UTC seconds since 1970-01-01, millisecond
-	/// precision in the fractional part, distinct from
-	/// the Manus publishTime bitfield inside the payload); unityRealtimeSinceStartupSec is
-	/// monotonic time since Unity started (editor launch in the Editor, app launch in builds —
-	/// not since entering play mode).
+	/// { "stream": "...", "unityEmitUnixTimeSec": ..., "manusPublishUnixTimeSec": ...,
+	/// "unityRealtimeSinceStartupSec": ..., "payload": {...} } envelope, and routes it.
+	/// The two Unity times are captured when the envelope is built: unityEmitUnixTimeSec is
+	/// wall clock (UTC seconds since 1970-01-01, millisecond precision in the fractional part);
+	/// unityRealtimeSinceStartupSec is monotonic time since Unity started (editor launch in the
+	/// Editor, app launch in builds — not since entering play mode). manusPublishUnixTimeSec is
+	/// Manus Core's own publishTime decoded to UTC Unix seconds (via CoreSDK.GetTimestampInfo);
+	/// for streams without a publishTime (landscape, system, connected, disconnected, hostsFound)
+	/// — or if decoding fails / is in timecode mode — it equals unityEmitUnixTimeSec, so consumers
+	/// can always read the single field.
 	///
 	/// Logging and publishing are independent, controlled per stream via <see cref="StreamOutput"/>:
 	/// - log     -> Debug.Log to the Console (see <see cref="Log"/>)
@@ -131,22 +134,59 @@ namespace UltraPose
 
 		// ---- Emission: log and publish are independent ----
 
-		/// <summary>Serialize + route a stream payload. Builds JSON once, and only if log or publish is on.</summary>
-		private void Emit<T>( StreamOutput p_Out, string p_Stream, T p_Payload )
+		/// <summary>Serialize + route a stream payload. Builds JSON once, and only if log or publish is on.
+		/// p_PublishTime is the payload's Manus publishTime, or null for streams that carry none.</summary>
+		private void Emit<T>( StreamOutput p_Out, string p_Stream, T p_Payload, CoreSDK.ManusTimestamp? p_PublishTime )
 		{
 			if( !p_Out.Any ) return;
-			Emit( p_Out, p_Stream, JsonUtility.ToJson( p_Payload ) );
+			Emit( p_Out, p_Stream, JsonUtility.ToJson( p_Payload ), p_PublishTime );
 		}
 
-		/// <summary>Route an already-serialized payload (used by connection events that build JSON manually).</summary>
-		private void Emit( StreamOutput p_Out, string p_Stream, string p_PayloadJson )
+		/// <summary>Route an already-serialized payload (used by connection events that build JSON manually).
+		/// p_PublishTime is surfaced as manusPublishUnixTimeSec; when null — or it can't be decoded — that
+		/// field falls back to unityEmitUnixTimeSec.</summary>
+		private void Emit( StreamOutput p_Out, string p_Stream, string p_PayloadJson, CoreSDK.ManusTimestamp? p_PublishTime )
 		{
 			// InvariantCulture: a comma-decimal locale would otherwise produce invalid JSON.
-			string t_UnixTimeSec = ( System.DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0 ).ToString( "F3", System.Globalization.CultureInfo.InvariantCulture );
-			string t_RealtimeSec = Time.realtimeSinceStartupAsDouble.ToString( "F6", System.Globalization.CultureInfo.InvariantCulture );
-			string t_Message = $"{{\"stream\":\"{p_Stream}\",\"unityEmitUnixTimeSec\":{t_UnixTimeSec},\"unityRealtimeSinceStartupSec\":{t_RealtimeSec},\"payload\":{p_PayloadJson}}}";
+			var t_Invariant = System.Globalization.CultureInfo.InvariantCulture;
+			double t_EmitUnixSec = System.DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0;
+			double t_ManusUnixSec = ( p_PublishTime.HasValue
+				&& TryGetManusUnixTimeSec( p_PublishTime.Value, out double t_Decoded ) )
+				? t_Decoded
+				: t_EmitUnixSec;
+
+			string t_EmitTimeSec = t_EmitUnixSec.ToString( "F3", t_Invariant );
+			string t_ManusTimeSec = t_ManusUnixSec.ToString( "F3", t_Invariant );
+			string t_RealtimeSec = Time.realtimeSinceStartupAsDouble.ToString( "F6", t_Invariant );
+			string t_Message = $"{{\"stream\":\"{p_Stream}\",\"unityEmitUnixTimeSec\":{t_EmitTimeSec},\"manusPublishUnixTimeSec\":{t_ManusTimeSec},\"unityRealtimeSinceStartupSec\":{t_RealtimeSec},\"payload\":{p_PayloadJson}}}";
 			if( p_Out.log ) Log( t_Message );
 			if( p_Out.publish ) Publish( p_Stream, t_Message );
+		}
+
+		/// <summary>
+		/// Decode a Manus packed-calendar timestamp to UTC Unix seconds (ms precision) via the SDK's
+		/// official decoder (CoreSdk_GetTimestampInfo). Returns false when the SDK can't decode it, the
+		/// fields are invalid, or it is in timecode mode (fraction counts frames, not ms — that needs the
+		/// landscape time.fps); callers then fall back to unityEmitUnixTimeSec.
+		/// </summary>
+		private static bool TryGetManusUnixTimeSec( CoreSDK.ManusTimestamp p_PublishTime, out double p_UnixSec )
+		{
+			p_UnixSec = 0.0;
+			if( CoreSDK.GetTimestampInfo( p_PublishTime, out CoreSDK.ManusTimestampInfo t_Info ) != CoreSDK.SDKReturnCode.Success )
+				return false;
+			if( t_Info.timecode ) return false; // fraction is frames, not ms
+
+			try
+			{
+				var t_Utc = new System.DateTimeOffset( (int)t_Info.year, t_Info.month, t_Info.day,
+					t_Info.hour, t_Info.minute, t_Info.second, t_Info.fraction, System.TimeSpan.Zero );
+				p_UnixSec = t_Utc.ToUnixTimeMilliseconds() / 1000.0;
+				return true;
+			}
+			catch( System.ArgumentOutOfRangeException )
+			{
+				return false; // guards an uninitialized/garbage timestamp (e.g. all-zero -> year 0)
+			}
 		}
 
 		/// <summary>
@@ -166,27 +206,28 @@ namespace UltraPose
 		}
 
 		// ---- Data stream handlers ----
-		private void OnSkeletonData( CoreSDK.SkeletonStream p_Stream ) => Emit( m_Skeleton, "skeleton", p_Stream );
-		private void OnErgonomicsData( CommunicationHub.ErgonomicsStream p_Stream ) => Emit( m_Ergonomics, "ergonomics", p_Stream );
-		private void OnRawSkeletonData( CoreSDK.RawSkeletonStream p_Stream ) => Emit( m_RawSkeleton, "rawSkeleton", p_Stream );
-		private void OnRawDeviceData( CoreSDK.RawData p_Data ) => Emit( m_RawDevice, "rawDevice", p_Data );
-		private void OnGestureData( CoreSDK.GestureStream p_Stream ) => Emit( m_Gesture, "gesture", p_Stream );
-		private void OnTrackerData( CoreSDK.TrackerStream p_Stream ) => Emit( m_Tracker, "tracker", p_Stream );
-		private void OnLandscape( CommunicationHub.Landscape p_Landscape ) => Emit( m_Landscape, "landscape", p_Landscape );
-		private void OnSystemMessage( CoreSDK.SystemMessage p_Message ) => Emit( m_SystemMessage, "system", p_Message );
+		// The six data streams carry a Manus publishTime; landscape and system do not (pass null).
+		private void OnSkeletonData( CoreSDK.SkeletonStream p_Stream ) => Emit( m_Skeleton, "skeleton", p_Stream, p_Stream.publishTime );
+		private void OnErgonomicsData( CommunicationHub.ErgonomicsStream p_Stream ) => Emit( m_Ergonomics, "ergonomics", p_Stream, p_Stream.publishTime );
+		private void OnRawSkeletonData( CoreSDK.RawSkeletonStream p_Stream ) => Emit( m_RawSkeleton, "rawSkeleton", p_Stream, p_Stream.publishTime );
+		private void OnRawDeviceData( CoreSDK.RawData p_Data ) => Emit( m_RawDevice, "rawDevice", p_Data, p_Data.publishTime );
+		private void OnGestureData( CoreSDK.GestureStream p_Stream ) => Emit( m_Gesture, "gesture", p_Stream, p_Stream.publishTime );
+		private void OnTrackerData( CoreSDK.TrackerStream p_Stream ) => Emit( m_Tracker, "tracker", p_Stream, p_Stream.publishTime );
+		private void OnLandscape( CommunicationHub.Landscape p_Landscape ) => Emit( m_Landscape, "landscape", p_Landscape, null );
+		private void OnSystemMessage( CoreSDK.SystemMessage p_Message ) => Emit( m_SystemMessage, "system", p_Message, null );
 
 		// ---- Connection handlers (no parameter — payloads constructed) ----
 		private void OnConnectedToCore()
 		{
 			if( !m_Connected.Any ) return;
 			var t_Host = ManusManager.communicationHub?.currentHost;
-			Emit( m_Connected, "connected", t_Host.HasValue ? JsonUtility.ToJson( t_Host.Value ) : "{}" );
+			Emit( m_Connected, "connected", t_Host.HasValue ? JsonUtility.ToJson( t_Host.Value ) : "{}", null );
 		}
 
 		private void OnDisconnectedFromCore()
 		{
 			if( !m_Disconnected.Any ) return;
-			Emit( m_Disconnected, "disconnected", "{}" );
+			Emit( m_Disconnected, "disconnected", "{}", null );
 		}
 
 		private void OnHostsFound()
@@ -194,7 +235,7 @@ namespace UltraPose
 			if( !m_HostsFound.Any ) return;
 			var t_Hub = ManusManager.communicationHub;
 			if( t_Hub == null ) return;
-			Emit( m_HostsFound, "hostsFound", JsonUtility.ToJson( new HostsMessage { hosts = t_Hub.GetHosts() } ) );
+			Emit( m_HostsFound, "hostsFound", JsonUtility.ToJson( new HostsMessage { hosts = t_Hub.GetHosts() } ), null );
 		}
 
 		/// <summary>Wrapper so the discovered-hosts list serializes — JsonUtility can't root a List.</summary>
